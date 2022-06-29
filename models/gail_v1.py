@@ -7,7 +7,6 @@ from models.nets import PolicyNetwork, ValueNetwork, Discriminator, OneHotDQN
 from utils.funcs import get_flat_grads, get_flat_params, set_params, \
     conjugate_gradient, rescale_and_linesearch
 PIT = 3
-# no cost model
 
 if torch.cuda.is_available():
     from torch.cuda import FloatTensor
@@ -36,6 +35,7 @@ class GAIL(Module):
 
         self.d = Discriminator(self.state_dim, self.action_dim, self.discrete)
 
+        self.cost_model = ValueNetwork(self.state_dim) # for cost
 
     def get_networks(self):
         return [self.pi, self.v]
@@ -49,6 +49,9 @@ class GAIL(Module):
         action = distb.sample().detach().cpu().numpy()
 
         return action
+
+
+
 
     def train(self, env, expert, render=False):
         num_iters = self.train_config["num_iters"]
@@ -70,46 +73,45 @@ class GAIL(Module):
         exp_constraints_iter = []
         exp_obs = []
         exp_acts = []
-        for i in range(10):
-            steps = 0
-            while steps < num_steps_per_iter:
-                ep_obs = []
-                ep_rwds = []
-                ep_constraints = []
-                t = 0
-                done = False
 
-                ob = env.reset()
+        steps = 0
+        while steps < num_steps_per_iter:
+            ep_obs = []
+            ep_rwds = []
+            ep_constraints = []
+            t = 0
+            done = False
 
-                while not done and steps < num_steps_per_iter:
-                    act = expert.act(ob)
+            ob = env.reset()
 
-                    ep_obs.append(ob)
-                    exp_obs.append(ob)
-                    exp_acts.append(act)
+            while not done and steps < num_steps_per_iter:
+                act = expert.act(ob)
 
-                    if render:
-                        env.render()
-                    ob, rwd, done, info = env.step(act)
+                ep_obs.append(ob)
+                exp_obs.append(ob)
+                exp_acts.append(act)
 
-                    ep_rwds.append(rwd)
-                    ep_constraints.append(info['pit'])
+                if render:
+                    env.render()
+                ob, rwd, done, info = env.step(act)
 
-                    t += 1
-                    steps += 1
+                ep_rwds.append(rwd)
+                ep_constraints.append(info['pit'])
 
-                    if horizon is not None:
-                        if t >= horizon:
-                            done = True
-                            break
+                t += 1
+                steps += 1
 
-                if done:
-                    exp_rwd_iter.append(np.sum(ep_rwds))
-                    exp_constraints_iter.append(np.sum(ep_constraints))
+                if horizon is not None:
+                    if t >= horizon:
+                        done = True
+                        break
 
-                ep_obs = FloatTensor(np.array(ep_obs))
-                ep_rwds = FloatTensor(ep_rwds)
+            if done:
+                exp_rwd_iter.append(np.sum(ep_rwds))
+                exp_constraints_iter.append(np.sum(ep_constraints))
 
+            ep_obs = FloatTensor(np.array(ep_obs))
+            ep_rwds = FloatTensor(ep_rwds)
 
         exp_rwd_mean = np.mean(exp_rwd_iter)
         exp_cost_mean = np.mean(exp_constraints_iter)
@@ -133,6 +135,7 @@ class GAIL(Module):
             rets = []
             advs = []
             gms = []
+            constraint_rets = []
 
             steps = 0
             while steps < num_steps_per_iter:
@@ -143,6 +146,7 @@ class GAIL(Module):
                 ep_disc_costs = []
                 ep_gms = []
                 ep_lmbs = []
+                ep_constraints = []
 
                 t = 0
                 done = False
@@ -163,6 +167,7 @@ class GAIL(Module):
                     ob, rwd, done, info = env.step(act)
 
                     ep_rwds.append(rwd)
+                    ep_constraints.append(info['pit'])
                     ep_gms.append(gae_gamma ** t)
                     ep_lmbs.append(gae_lambda ** t)
 
@@ -189,13 +194,20 @@ class GAIL(Module):
                     .squeeze().detach()  #在一条轨迹中，每个time step,用discriminator求出的值（输入有state space和action space，输出值)。 故有T维的cost
                 ep_disc_costs = ep_gms * ep_costs
 
-
                 ep_disc_rets = FloatTensor(
                     [sum(ep_disc_costs[i:]) for i in range(t)]
                 ) #从每个t开始到最后求和ep_disc_costs
+
+
                 ep_rets = ep_disc_rets / ep_gms
 
                 rets.append(ep_rets)
+
+                ep_constraints = torch.tensor(ep_constraints)
+                ep_constraints_rets = FloatTensor(
+                    [sum(ep_constraints[i:]) for i in range(t)]
+                ) # for every time t, collect costs from t to end.
+                constraint_rets.append(ep_constraints_rets)
 
                 ##### use value
                 self.v.eval()
@@ -203,10 +215,22 @@ class GAIL(Module):
                 next_vals = torch.cat(
                     (self.v(ep_obs)[1:], FloatTensor([[0.]]))
                 ).detach()
+                #c_q_values = self.cost_model(ep_obs).detach()   # add cost model here
+                #cost_ = env.maze[PIT]
+                #cost_ = torch.from_numpy(cost_)
+                #cost_ = cost_.unsqueeze(-1)
+
+                #######################################################################################################
+                self.cost_model.eval()
+                curr_costs = self.cost_model(ep_obs).detach()
+                next_costs = torch.cat(
+                    (self.cost_model(ep_obs)[1:], FloatTensor([[0.]]))
+                ).detach()
+                #######################################################################################################
 
                 ep_deltas = ep_costs.unsqueeze(-1)\
                     + gae_gamma * next_vals\
-                    - curr_vals# - lamda2_ * (c_q_values-cost_) #cost goes here
+                    - curr_vals - lamda2_*(next_costs - curr_costs)# - lamda2_ * (c_q_values-cost_) #cost goes here
 
                 ep_advs = FloatTensor([
                     ((ep_gms * ep_lmbs)[:t - j].unsqueeze(-1) * ep_deltas[j:])
@@ -220,7 +244,7 @@ class GAIL(Module):
             rwd_iter_means.append(np.mean(rwd_iter))
             cost_iter_means.append(np.mean(cost_iter))
             print(
-                 "Iterations: {},   Reward Mean: {},   Cost Mean: {}"
+                "Iterations: {},   Reward Mean: {},  Cost Mean: {}"
                 .format(i + 1, np.mean(rwd_iter), np.mean(cost_iter))
             )
 
@@ -229,11 +253,12 @@ class GAIL(Module):
             rets = torch.cat(rets)  # 每个轨迹算出的deicriminator的值,几个time step,几维
             advs = torch.cat(advs)  # 每个轨迹算出的value network的值,几个time step,几维
             gms = torch.cat(gms)
+            constraint_rets = torch.cat(constraint_rets)
 
             if normalize_advantage:
                 advs = (advs - advs.mean()) / advs.std()
 
-            ##################################################################################################
+            ############################################################################################################
             #### update discriminator parameters, no update
             self.d.train()
             exp_scores = self.d.get_logits(exp_obs, exp_acts)
@@ -248,7 +273,8 @@ class GAIL(Module):
                 )        # discriminator loss w
             loss.backward()
             opt_d.step()
-            #############################################################################################
+            ############################################################################################################
+            # update value network parameters
             self.v.train()
             old_params = get_flat_params(self.v).detach()
             old_v = self.v(obs).detach()
@@ -275,7 +301,37 @@ class GAIL(Module):
             new_params = old_params + alpha * s
 
             set_params(self.v, new_params)
+            ############################################################################################################
+            # update cost value network parameters
+            self.cost_model.train()
+            old_params = get_flat_params(self.cost_model).detach()
+            old_cost = self.cost_model(obs).detach()
 
+            def constraint():
+                return ((old_cost - self.cost_model(obs)) ** 2).mean()
+
+            grad_diff = get_flat_grads(constraint(), self.cost_model)
+
+            def Hv(v):
+                hessian = get_flat_grads(torch.dot(grad_diff, v), self.cost_model)\
+                    .detach()
+
+                return hessian
+
+            g = get_flat_grads(
+                ((-1) * (self.cost_model(obs).squeeze() - constraint_rets) ** 2).mean(), self.cost_model
+            ).detach()
+            s = conjugate_gradient(Hv, g).detach()
+
+            Hs = Hv(s).detach()
+            alpha = torch.sqrt(2 * eps / torch.dot(s, Hs))
+
+            new_params = old_params + alpha * s
+
+            set_params(self.cost_model, new_params)
+            ############################################################################################################
+
+            # update policy network parameters
             self.pi.train()
             old_params = get_flat_params(self.pi).detach()
             old_distb = self.pi(obs)
@@ -343,4 +399,5 @@ class GAIL(Module):
             ##############################################################################
             set_params(self.pi, new_params)
 
-        return exp_rwd_mean, rwd_iter_means
+
+        return exp_rwd_mean, exp_cost_mean,rwd_iter_means,cost_iter_means

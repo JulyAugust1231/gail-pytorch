@@ -8,14 +8,14 @@ import gym
 
 from models.nets import Expert
 from models.gail import GAIL
-
+from models.safety_gridworld import PitWorld
 
 def main(env_name):
     ckpt_path = "ckpts"
     if not os.path.isdir(ckpt_path):
         os.mkdir(ckpt_path)
 
-    if env_name not in ["CartPole-v1", "Pendulum-v0", "BipedalWalker-v3"]:
+    if env_name not in ["CartPole-v1", "Pendulum-v0", "BipedalWalker-v3", "Gridworld"]:
         print("The environment name is wrong!")
         return
 
@@ -35,13 +35,29 @@ def main(env_name):
     with open(os.path.join(ckpt_path, "model_config.json"), "w") as f:
         json.dump(config, f, indent=4)
 
-    env = gym.make(env_name)
-    env.reset()
+    if env_name in ["CartPole-v1", "Pendulum-v0", "BipedalWalker-v3"]:
+        env = gym.make(env_name)
+        env.reset()
+        state_dim = len(env.observation_space.high)
+    else:
+        env = PitWorld(size = 14,
+                       max_step = 400,
+                       per_step_penalty = -1.0,
+                       goal_reward = 1000.0,
+                       obstace_density = 0.3,
+                       constraint_cost = 1.0,
+                       random_action_prob = 0.005,
+                       one_hot_features=True,
+                       rand_goal=False, # for testing purposes
+                       )
+        state_dim = env.reset().shape
+        state_dim = state_dim[0]
 
-    state_dim = len(env.observation_space.high)
-    if env_name in ["CartPole-v1"]:
+
+    if env_name in ["CartPole-v1","Gridworld"]:
         discrete = True
         action_dim = env.action_space.n
+        print(env.to_string())
     else:
         discrete = False
         action_dim = env.action_space.shape[0]
@@ -91,7 +107,7 @@ if __name__ == "__main__":
         default="CartPole-v1",
         help="Type the environment name to run. \
             The possible environments are \
-                [CartPole-v1, Pendulum-v0, BipedalWalker-v3]"
+                [CartPole-v1, Pendulum-v0, BipedalWalker-v3,Gridworld]"
     )
     args = parser.parse_args()
 

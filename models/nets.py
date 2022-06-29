@@ -10,6 +10,24 @@ else:
     from torch import FloatTensor
 
 
+class OneHotDQN(Module):
+    def __init__(self, num_inputs, num_actions):
+        super(OneHotDQN, self).__init__()
+
+        self.net = Sequential(
+            Linear(num_inputs, 50),
+            Tanh(),
+            Linear(50, 50),
+            Tanh(),
+            Linear(50, 50),
+            Tanh(),
+            Linear(50, num_actions),
+        )
+
+    def forward(self, x):
+        q_vals = self.net(x)
+        return q_vals
+
 class PolicyNetwork(Module):
     def __init__(self, state_dim, action_dim, discrete) -> None:
         super().__init__()
